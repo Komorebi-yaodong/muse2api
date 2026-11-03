@@ -12,9 +12,9 @@ services:
       MUSE2API_CHAT_TIMEOUT: "300"
     volumes:
       - type: volume
-        source: muse2api_data
+        source: musedata
         target: /app/data
     shm_size: "512mb"
 
 volumes:
-  muse2api_data:
+  musedata:
