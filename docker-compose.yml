@@ -5,14 +5,16 @@ services:
     ports:
       - "18610:18610"
     environment:
-      - MUSE2API_KEY=${MUSE2API_KEY:-}
-      - MUSE2API_PUBLIC_BASE=${CLOADY_PRIMARY_URL}
-      - MUSE2API_IMAGE_TIMEOUT=240
-      - MUSE2API_VIDEO_TIMEOUT=600
-      - MUSE2API_CHAT_TIMEOUT=300
+      MUSE2API_KEY: ${MUSE2API_KEY:-}
+      MUSE2API_PUBLIC_BASE: ${CLOADY_PRIMARY_URL}
+      MUSE2API_IMAGE_TIMEOUT: "240"
+      MUSE2API_VIDEO_TIMEOUT: "600"
+      MUSE2API_CHAT_TIMEOUT: "300"
     volumes:
-      - muse2api_data:/app/data
-    shm_size: '512mb'
+      - type: volume
+        source: muse2api_data
+        target: /app/data
+    shm_size: "512mb"
 
 volumes:
   muse2api_data:
