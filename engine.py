@@ -222,8 +222,31 @@ class MuseProxyError(MuseGenerationError):
     """The account's configured proxy failed; this is not Cookie invalidation."""
 
 
+class MuseSessionUnavailable(MuseGenerationError):
+    """/api/session returned 200 without an assigned workspace.
+
+    muse.ai may rotate hatch_sess / hatch_gw in that same response and revoke the old
+    values, so the merged cookies are carried here and callers must keep using them.
+    """
+
+    def __init__(self, message: str, cookies: dict | None = None,
+                 cookies_exp: dict | None = None, rotated: bool = False):
+        super().__init__(message)
+        self.cookies = cookies or {}
+        self.cookies_exp = cookies_exp or {}
+        self.rotated = rotated
+
+
 class MuseModelRefusalError(MuseGenerationError):
     """Muse completed the turn with text instead of the requested media."""
+
+
+class MuseServiceBusyError(MuseGenerationError):
+    """Muse's own media backend reported a temporary outage (overload / HTTP 503).
+
+    Unlike a refusal this says nothing about the prompt or the account, so the
+    generation is retried after a short pause while the time budget allows.
+    """
 
 
 class RefImageSafetyError(MuseGenerationError):
@@ -350,55 +373,55 @@ class MuseEngine:
         with self._start_lock:
             if self.proc and self.proc.poll() is None and self.browser:
                 return
-        env = dict(os.environ)
-        env.setdefault("HOME", self.cfg.home_dir)
-        env["PATH"] = (self.cfg.extra_path + os.pathsep + env.get("PATH", "")) if self.cfg.extra_path else env.get("PATH", "")
-        args = [
-            self.cfg.chromium,
-            "--headless=new", "--no-sandbox", "--disable-gpu",
-            "--disable-dev-shm-usage", "--disable-background-networking",
-            "--no-first-run", "--no-default-browser-check",
-            "--autoplay-policy=no-user-gesture-required",
-            "--window-size=1440,2400",
-            f"--remote-debugging-port={self.cfg.cdp_port}",
-            "--remote-allow-origins=*",
-            f"--user-data-dir={self.cfg.profile_dir}",
-            "about:blank",
-        ]
-        # 尝试复用已有健康 CDP
-        if not self.proc:
-            try:
-                v = http_json(self._debug_url(), timeout=1)
-                if v and "webSocketDebuggerUrl" in v:
-                    self.browser = CDP(v["webSocketDebuggerUrl"], timeout=180)
-                    return
-            except Exception:
-                pass
-
-        # 清理残留锁
-        for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
-            lp = os.path.join(self.cfg.profile_dir, lock_name)
-            if os.path.exists(lp) or os.path.islink(lp):
+            env = dict(os.environ)
+            env.setdefault("HOME", self.cfg.home_dir)
+            env["PATH"] = (self.cfg.extra_path + os.pathsep + env.get("PATH", "")) if self.cfg.extra_path else env.get("PATH", "")
+            args = [
+                self.cfg.chromium,
+                "--headless=new", "--no-sandbox", "--disable-gpu",
+                "--disable-dev-shm-usage", "--disable-background-networking",
+                "--no-first-run", "--no-default-browser-check",
+                "--autoplay-policy=no-user-gesture-required",
+                "--window-size=1440,2400",
+                f"--remote-debugging-port={self.cfg.cdp_port}",
+                "--remote-allow-origins=*",
+                f"--user-data-dir={self.cfg.profile_dir}",
+                "about:blank",
+            ]
+            # 尝试复用已有健康 CDP
+            if not self.proc:
                 try:
-                    os.unlink(lp)
+                    v = http_json(self._debug_url(), timeout=1)
+                    if v and "webSocketDebuggerUrl" in v:
+                        self.browser = CDP(v["webSocketDebuggerUrl"], timeout=180)
+                        return
                 except Exception:
                     pass
 
-        os.makedirs(self.cfg.data_dir, exist_ok=True)
-        self._log = open(os.path.join(self.cfg.data_dir, "chromium.log"), "ab", buffering=0)
-        cwd_dir = self.cfg.home_dir if (self.cfg.home_dir and os.path.isdir(self.cfg.home_dir)) else None
-        self.proc = subprocess.Popen(args, stdout=self._log, stderr=subprocess.STDOUT,
-                                     env=env, cwd=cwd_dir)
-        last = None
-        for _ in range(90):
-            try:
-                v = http_json(self._debug_url(), timeout=2)
-                self.browser = CDP(v["webSocketDebuggerUrl"], timeout=180)
-                return
-            except Exception as exc:  # noqa: BLE001
-                last = exc
-                time.sleep(1)
-        raise MuseGenerationError(f"Chromium 启动失败: {last}")
+            # 清理残留锁
+            for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+                lp = os.path.join(self.cfg.profile_dir, lock_name)
+                if os.path.exists(lp) or os.path.islink(lp):
+                    try:
+                        os.unlink(lp)
+                    except Exception:
+                        pass
+
+            os.makedirs(self.cfg.data_dir, exist_ok=True)
+            self._log = open(os.path.join(self.cfg.data_dir, "chromium.log"), "ab", buffering=0)
+            cwd_dir = self.cfg.home_dir if (self.cfg.home_dir and os.path.isdir(self.cfg.home_dir)) else None
+            self.proc = subprocess.Popen(args, stdout=self._log, stderr=subprocess.STDOUT,
+                                         env=env, cwd=cwd_dir)
+            last = None
+            for _ in range(90):
+                try:
+                    v = http_json(self._debug_url(), timeout=2)
+                    self.browser = CDP(v["webSocketDebuggerUrl"], timeout=180)
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    last = exc
+                    time.sleep(1)
+            raise MuseGenerationError(f"Chromium 启动失败: {last}")
 
     def stop(self):
         with self._start_lock:
@@ -571,13 +594,24 @@ class MuseEngine:
                 sj = r.json()
             except ValueError:
                 raise MuseGenerationError("/api/session HTTP 200 返回非 JSON；会话状态未确认") from None
-            if not isinstance(sj, dict) or sj.get("status") != "assigned":
+            if not isinstance(sj, dict):
                 raise MuseGenerationError("/api/session HTTP 200 未返回 assigned 会话；请在官网检查账号/工作区状态")
+            # A genuine session answer may rotate credentials even when no workspace is
+            # assigned. Harvest Set-Cookie before evaluating the workspace status.
+            rotated = False
             for c in r.cookies:
                 if c.value:
+                    if cur_cookies.get(c.name) != c.value:
+                        rotated = True
                     cur_cookies[c.name] = c.value
                 if c.expires:
                     cur_exp[c.name] = int(float(c.expires))
+            if sj.get("status") != "assigned":
+                status = sj.get("status")
+                raise MuseSessionUnavailable(
+                    f"/api/session HTTP 200 未返回 assigned 会话（status={status}）；"
+                    f"工作区暂未分配，已保留 muse.ai 轮换下发的新 cookie",
+                    cur_cookies, cur_exp, rotated)
             vm_id = sj.get("vm_id")
             vm_state = sj.get("vm_state")
             wake_ok = False
@@ -593,12 +627,23 @@ class MuseEngine:
                     if proxy and rw.status_code == 407:
                         raise MuseProxyError("账号代理认证失败 (HTTP 407)，未完成 VM 唤醒")
                     wake_requested = rw.status_code == 200
+                    for c in rw.cookies:
+                        if c.value:
+                            cur_cookies[c.name] = c.value
+                        if c.expires:
+                            cur_exp[c.name] = int(float(c.expires))
+                    headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cur_cookies.items() if v)
                     if wake_requested:
                         # HTTP 200 acknowledges the request; only session state confirms the VM woke.
                         verify = requests.get("https://muse.ai/api/session", headers=headers,
                                               timeout=12, allow_redirects=False, **proxy_options)
                         if proxy and verify.status_code == 407:
                             raise MuseProxyError("账号代理认证失败 (HTTP 407)，未完成 VM 状态确认")
+                        for c in verify.cookies:
+                            if c.value:
+                                cur_cookies[c.name] = c.value
+                            if c.expires:
+                                cur_exp[c.name] = int(float(c.expires))
                         if verify.status_code == 200:
                             verified_session = verify.json()
                             if isinstance(verified_session, dict) and verified_session.get("status") == "assigned":
@@ -743,6 +788,18 @@ class MuseEngine:
         except Exception:
             pass
 
+    # Set by the app: persist cookies that muse.ai rotated during an engine-side renewal.
+    cookie_sink = None
+
+    def _report_rotated_cookies(self, account_id, cookies: dict, expires: dict | None):
+        sink = self.cookie_sink
+        if not (sink and account_id and cookies):
+            return
+        try:
+            sink(account_id, dict(cookies), dict(expires or {}))
+        except Exception as e:  # noqa: BLE001
+            log.warning("保存轮换后的 cookie 失败 %s: %s", account_id, e)
+
     def ensure_page(self, cookies: dict, expires: dict | None = None, account_id: str | None = None):
         resolver = getattr(self, "proxy_resolver", None)
         local = self._ensure_local()
@@ -776,6 +833,16 @@ class MuseEngine:
                     last_map[account_id] = now_ts
             except (MuseAuthError, MuseProxyError):
                 raise
+            except MuseSessionUnavailable as e:
+                if e.cookies:
+                    cookies = e.cookies
+                    expires = e.cookies_exp or expires
+                    if e.rotated:
+                        self._report_rotated_cookies(account_id, cookies, expires)
+                if account_id:
+                    last_map[account_id] = now_ts
+                log.warning("预续签 /api/session 未分配工作区（继续用%s cookie 加载页面）: %s",
+                            "轮换后的新" if e.rotated else "现有", e)
             except Exception as e:
                 log.warning("预续签 /api/session 失败（继续尝试浏览器加载）: %s", e)
 
@@ -1014,11 +1081,52 @@ class MuseEngine:
     # 检查「文字真的进了输入框 + Send 按钮真的被渲染出来」。
     # 两个条件缺一不可：Send 按钮只有 React state 里有文字才会渲染 ——
     # 它在，就说明 React 真的收到了输入（不是 DOM value 被改了而已）。
+    _SEND_BUTTON_JS = r"""(function(){
+        function visible(e){
+            return e.getClientRects().length > 0
+                && getComputedStyle(e).visibility !== 'hidden';
+        }
+        var ta = document.activeElement;
+        if (!ta || !ta.matches('textarea') || !visible(ta)) {
+            ta = Array.from(document.querySelectorAll('textarea')).find(visible);
+        }
+        if (!ta) return null;
+        var label = /^(?:send(?:\s+message)?|发送(?:消息)?|發送(?:訊息)?|傳送(?:訊息)?|送出)$/i;
+        var testId = /^(?:hatch-composer-send-button|composer-send-button|send-button)$/i;
+        function isSend(b){
+            // The Send button itself uses the bg-chat-user-bubble color class.
+            // Exclude message containers, not buttons carrying that color token.
+            if (!visible(b) || b.closest('aside,nav,[role="navigation"],'
+                + 'div[class*="chat-user-bubble"],div[class*="group/msg"],'
+                + 'div[class*="hatch-chat-groupable-bubble"]')) return false;
+            return label.test((b.getAttribute('aria-label') || '').trim())
+                || testId.test((b.getAttribute('data-testid') || '').trim())
+                || label.test((b.innerText || '').trim());
+        }
+        // Search the nearest composer first. Never search the whole document:
+        // a history preview may itself contain "send", "Resend" or "Send feedback".
+        for (var r = ta.parentElement; r && r !== document.body; r = r.parentElement) {
+            var b = Array.from(r.querySelectorAll('button,[role="button"]')).find(isSend);
+            if (b) return b;
+            if (r.matches('form,main,[role="main"]')) break;
+        }
+        return null;
+    })()"""
+    _SEND_DISABLED_JS = (
+        "b.disabled || b.matches(':disabled')"
+        " || b.getAttribute('aria-disabled') === 'true' || b.closest('[inert]')"
+    )
     _SEND_STATE_JS = (
         "(function(){var ta=document.querySelector('textarea');"
-        "var b=[...document.querySelectorAll('button,[role=button]')]"
-        ".find(function(x){return /send/i.test(x.getAttribute('aria-label')||'');});"
-        "return JSON.stringify({v:ta?ta.value:'',btn:b?(b.disabled?2:1):0});})()"
+        "var b=" + _SEND_BUTTON_JS + ";"
+        "return JSON.stringify({v:ta?ta.value:'',btn:b?("
+        + _SEND_DISABLED_JS + "?2:1):0});})()"
+    )
+    _CLICK_SEND_JS = (
+        "(function(){var b=" + _SEND_BUTTON_JS + ";"
+        "if(!b)return 'no-button';"
+        "if(" + _SEND_DISABLED_JS + ")return 'disabled';"
+        "b.click();return 'clicked';})()"
     )
 
     def _send(self, prompt: str):
@@ -1069,15 +1177,7 @@ class MuseEngine:
         clicked = "no-button"
         t_deadline = time.time() + 3.0
         while time.time() < t_deadline:
-            res = self.page.js(
-                "(function(){var b=[...document.querySelectorAll('button,[role=button]')]"
-                ".filter(function(x){return x.offsetParent!==null;})"
-                ".find(function(x){return /发送|send/i.test(x.getAttribute('aria-label')||'')"
-                "||/发送|send/i.test(x.getAttribute('data-testid')||'')"
-                "||/send/i.test(x.innerText||'');});"
-                "if(!b)return 'no-button';"
-                "if(b.disabled)return 'disabled';"
-                "b.click();return 'clicked';})()")
+            res = self._click_send()
             if res == "clicked":
                 clicked = "clicked"
                 break
@@ -1103,6 +1203,27 @@ class MuseEngine:
                     pass
         time.sleep(0.3)
         return clicked
+
+    def _composer_unsent(self) -> str:
+        """输入框里还留着什么（没发出去的附件 / 文字）；空串 = 输入框是空的。读不到时按空处理（不误判）。"""
+        try:
+            n = int(self.page.js(self._ATTACHED_COUNT_JS) or 0)
+            t = int(self.page.js("(document.querySelector('textarea')||{value:''}).value.length") or 0)
+        except Exception:  # noqa: BLE001
+            return ""
+        parts = []
+        if n:
+            parts.append("%d 个附件" % n)
+        if t:
+            parts.append("%d 字提示词" % t)
+        return "、".join(parts)
+
+    def _click_send(self) -> str:
+        """只点当前输入框的发送按钮（不重新填字），不把点击等同于上游送达。"""
+        try:
+            return str(self.page.js(self._CLICK_SEND_JS))
+        except Exception:  # noqa: BLE001
+            return "error"
 
     # ---------------- 等待生成 ----------------
     def _last_attachment(self) -> dict | None:
@@ -1141,6 +1262,7 @@ class MuseEngine:
         previous_state = None
         last_activity = t_start
         progress_sent = 0
+        resent = False
         while time.time() < deadline:
             if stop_event is not None and stop_event.is_set():
                 raise MuseGenerationError("客户端已断开连接，终止生成任务")
@@ -1233,6 +1355,17 @@ class MuseEngine:
                     except Exception:
                         pass
 
+            # COOL AI 2026-11-08：发出 25 秒后模型毫无回复、输入框里还留着附件 / 文字 = 这条消息没发出去。
+            # 补点一次发送；60 秒仍没发出就报错，交给外层换号重试（以前要干等到总超时 10 分钟）。
+            if elapsed > 25.0 and cur_cnt == base_agent_cnt:
+                unsent = self._composer_unsent()
+                if unsent and not resent:
+                    resent = True
+                    log.warning("提示词发出 %.0f 秒后仍在输入框（%s），补点一次发送", elapsed, unsent)
+                    self._click_send()
+                elif unsent and elapsed > 60.0:
+                    raise MuseGenerationError("提示词没有发出去（%s 仍在输入框里），终止等待并换号重试" % unsent)
+
             if re.search(r"额度不足|积分不足|out of credits|达到上限|token limit", tail, re.I):
                 raise MuseGenerationError("账号额度不足")
             # A Stop button is also shown for messages never acknowledged by the gateway.
@@ -1264,6 +1397,9 @@ class MuseEngine:
                         last_txt, txt_stable = cur_txt, 0
                     if txt_stable >= 15 and elapsed > 8.0:
                         clean = self._clean_model_text(cur_txt)
+                        if self._media_service_busy(cur_txt):
+                            raise MuseServiceBusyError(
+                                f"Muse 媒体服务暂时不可用（上游过载/503），本次未生成媒体: {clean}")
                         raise MuseModelRefusalError(
                             f"模型未生成媒体，仅返回文本: {clean}")
                 else:
@@ -1314,6 +1450,29 @@ class MuseEngine:
             r"\b(?:generated|created|rendered|completed|ready)\b|"
             r"\b(?:generated|created|rendered|completed)\b[^.\n]{0,32}"
             r"\b(?:video|clip|image|picture|animation)\b", text, re.I))
+
+    # Muse's agent reports its own media-backend outages in prose, e.g.
+    # "视频服务那边暂时过载了（503）" / "视频生成服务暂时不可用" / "video service is overloaded".
+    _SERVICE_BUSY_RE = re.compile(
+        r"(?:\b50[234]\b|过载|超载|繁忙|拥挤|"
+        r"(?:服务|接口|后端|那边)[^。！？!?\n]{0,12}(?:暂时)?(?:不可用|无法使用|出错|返回(?:了)?(?:错误|不可用))|"
+        r"暂时不可用|暂不可用|"
+        r"\boverload(?:ed)?\b|\btemporarily unavailable\b|\bservice unavailable\b|"
+        r"\b(?:service|server|backend)\b[^.\n]{0,40}\b(?:unavailable|down|busy|error)\b)",
+        re.I)
+    # Content/policy/region problems are not transient even if the reply also says "try again".
+    _SERVICE_BUSY_EXCLUDE_RE = re.compile(
+        r"国家|地区|country|region|违规|政策|policy|安全|safety|不允许|not allowed|"
+        r"额度|积分|credits?\b|quota|上限|limit reached",
+        re.I)
+
+    @classmethod
+    def _media_service_busy(cls, text: str) -> bool:
+        """True only when the reply blames a temporary outage of Muse's media service."""
+        clean = cls._clean_model_text(text, limit=2000)
+        if not clean or cls._SERVICE_BUSY_EXCLUDE_RE.search(clean):
+            return False
+        return bool(cls._SERVICE_BUSY_RE.search(clean))
 
     @classmethod
     def _media_refusal_text(cls, text: str, expect: str) -> str:
@@ -1521,6 +1680,77 @@ class MuseEngine:
             last = info.get("err", "未知")
             time.sleep(2)
         raise MuseGenerationError(f"未能取回生成结果: {last}")
+
+    # ---------------- 原图（#62）----------------
+    # muse.ai 2026-11-19 起聊天气泡里只画一张约 498px 宽的缩略图（blob:，usage=thumbnail），
+    # 原图要等用户点开图片查看器时才经网关取回。图片任务在这里点开查看器、取更大的那张，再关掉。
+    # 只对看起来是缩略图的结果做（长边 < 1000）；查看器打不开或没有更大的图就退回缩略图并记日志。
+    _OPEN_VIEWER_JS = r"""(function(src){
+      var img=[...document.querySelectorAll('img')].find(function(m){return (m.currentSrc||m.src||'')===src;});
+      if(!img) return 'no-thumbnail';
+      var box=img.closest('[data-testid^="hatch-chat-attachment-presentation-"]');
+      var b=img.closest('button,[role=button]');
+      if(!b||!box||!box.contains(b)) return 'no-button';
+      if(b.disabled||b.getAttribute('aria-disabled')==='true') return 'disabled';
+      b.click(); return 'clicked';
+    })(%s)"""
+    _VIEWER_IMG_JS = r"""(function(src, minW){
+      var best=null;
+      document.querySelectorAll('img').forEach(function(m){
+        var s=m.currentSrc||m.src||'';
+        if(!s||s===src||!m.complete||!(m.naturalWidth>minW)) return;
+        if(m.closest('[data-testid^="hatch-chat-attachment-presentation-"]')) return;
+        var area=m.naturalWidth*m.naturalHeight;
+        if(!best||area>best.area) best={src:s,w:m.naturalWidth,h:m.naturalHeight,area:area,
+          dialog:!!m.closest('[role=dialog],[aria-modal=true]')};
+      });
+      return JSON.stringify(best);
+    })(%s, %s)"""
+    _CLOSE_VIEWER_JS = (
+        "(function(){var t=document.activeElement||document.body;"
+        "['keydown','keyup'].forEach(function(k){t.dispatchEvent(new KeyboardEvent(k,"
+        "{key:'Escape',code:'Escape',keyCode:27,which:27,bubbles:true,cancelable:true}));});return 1;})()"
+    )
+
+    def _full_image_src(self, att: dict, timeout: float = 20.0) -> dict | None:
+        """{src, w, h} of the full-size picture behind a chat thumbnail, or None (keep the thumbnail)."""
+        src = att.get("src") or ""
+        w, h = int(att.get("w") or 0), int(att.get("h") or 0)
+        if not src or not w or max(w, h) >= 1000:
+            return None
+        try:
+            opened = self.page.js(self._OPEN_VIEWER_JS % json.dumps(src))
+        except Exception as exc:  # noqa: BLE001
+            opened = "error: %s" % type(exc).__name__
+        if opened != "clicked":
+            log.warning("图片只有 %sx%s 缩略图，没能打开查看器取原图（%s），先返回缩略图", w, h, opened)
+            return None
+        best, stable = None, 0
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(0.5)
+            try:
+                raw = self.page.js(self._VIEWER_IMG_JS % (json.dumps(src), w))
+                cur = json.loads(raw) if raw else None
+            except Exception:  # noqa: BLE001
+                cur = None
+            if not cur:
+                continue
+            if best and cur["src"] == best["src"]:
+                stable += 1
+            else:
+                best, stable = cur, 0
+            if stable >= 2:     # the same larger picture for about a second: fully loaded
+                break
+        if not best:
+            log.warning("查看器里没有出现比 %sx%s 更大的图片，先返回缩略图", w, h)
+        return best
+
+    def _close_viewer(self):
+        try:
+            self.page.js(self._CLOSE_VIEWER_JS)
+        except Exception:  # noqa: BLE001
+            pass
 
     # ---------------- 下载兜底 ----------------
     def _download_fallback(self, src: str, timeout: int = 180) -> str | None:
@@ -1827,8 +2057,20 @@ class MuseEngine:
 
             data = mime = url = None
             selected_src = (att.get("vSrc") if expect == "video" else None) or att.get("src") or ""
+            out_w, out_h = att.get("w"), att.get("h")
+            full = self._full_image_src(att) if expect == "image" else None
+            if full:
+                try:
+                    data, mime, url = self.extract_bytes(full["src"], expect=expect)
+                    out_w, out_h = full["w"], full["h"]
+                    log.info("取到原图 %sx%s（聊天里的缩略图 %sx%s）", full["w"], full["h"], att.get("w"), att.get("h"))
+                except Exception:  # noqa: BLE001
+                    data = mime = url = None
+                    log.warning("原图读取失败，改用缩略图")
+                self._close_viewer()
             try:
-                data, mime, url = self.extract_bytes(selected_src, expect=expect)
+                if not data:
+                    data, mime, url = self.extract_bytes(selected_src, expect=expect)
             except Exception:  # noqa: BLE001
                 self._debug_dump("extract-fail")
 
@@ -1850,7 +2092,7 @@ class MuseEngine:
                 return {"path": dst, "filename": name, "size": len(data), "ext": ext, "mime": mime,
                         "kind": kind,
                         "via": "blob", "attachment": att.get("tid"),
-                        "w": att.get("w"), "h": att.get("h")}
+                        "w": out_w, "h": out_h}
 
             path = self._download_fallback(selected_src)
             if not path:

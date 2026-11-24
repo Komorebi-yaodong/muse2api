@@ -1,19 +1,13 @@
 {
-  "version": "1.6.7",
-  "updated_at": "2026-11-03",
+  "version": "1.6.14",
+  "updated_at": "2026-11-24",
   "repo": "https://github.com/czg86389-hub/muse2api",
   "highlights": [
-    "修复 Muse 新版无 overlay/form 输入区的附件定位和确认，兼容旧版并排除历史聊天附件。",
-    "新增视频、音频、PDF/Word 参考素材：最多 10 个，单个 40 MiB、合计 100 MiB；MP4/MOV/3GP/WebM 必须含有效时长且不超过 120 秒。",
-    "混合素材提示词支持 [图N]/[视频N]/[音频N]/[文档N] 对照，避免强制第一张图片为起始帧而忽略视频参考。",
-    "修复原始参考素材误当成品、3 次过滤后提前失败、CDP 异常临时文件残留，以及 Snap Chromium 无法读取系统 /tmp 素材的问题。",
-    "浏览器插件继续使用 1.0.2、油猴脚本 1.1.2；仍使用旧插件的用户必须手动升级并重新加载，每个浏览器个人资料分别操作。"
+    "1.6.14：muse.ai 过载时视频更快出结果。muse.ai 过载时，一次失败的视频要等 6~7 分钟才会说“503”，再换号重试又是一轮。现在只要最近 20 分钟内出现过过载回复，新的视频任务会同时在 2 个空闲账号上生成，先出片者为准，另一路立即取消（不记为账号异常、不再重试）。",
+    "muse.ai 正常时行为不变（单账号）；图片任务、指定账号的任务不并行。代价：过载期间每个视频消耗 2 个账号的额度。可用 MUSE2API_VIDEO_HEDGE=0 关闭，MUSE2API_VIDEO_HEDGE_WINDOW 调整时长。服务重启后会从最近的任务记录恢复并行状态。无需升级浏览器插件。"
   ],
   "highlights_en": [
-    "Fix attachment selection and confirmation for the new Muse composer without an overlay/form, retaining old-layout support and excluding chat history.",
-    "Add video, audio and PDF/Word references: up to 10 files, 40 MiB each, 100 MiB total. MP4/MOV/3GP/WebM require readable positive duration metadata of no more than 120 seconds.",
-    "Map mixed-reference markers to attachment order without forcing the first image to be the opening frame when video/audio references are present.",
-    "Fix uploaded references being returned as results, premature failure after three skipped references, temporary-file leaks after CDP errors, and Snap Chromium file access.",
-    "Extension remains 1.0.2 and userscript 1.1.2. Users on older extensions must replace files and reload manually in every browser profile."
+    "1.6.14: faster videos while muse.ai is overloaded. A failed video turn takes 6-7 minutes before muse.ai reports the 503, and the retry is another full round. For 20 minutes after any overload reply, new video tasks now run on two idle accounts at once; the first finished video wins and the other attempt is cancelled at once (not booked as an account fault, not retried).",
+    "Nothing changes while muse.ai is healthy (one account); image tasks and tasks pinned to an account never run in parallel. Cost: during an overload each video uses two accounts' allowance. MUSE2API_VIDEO_HEDGE=0 turns it off, MUSE2API_VIDEO_HEDGE_WINDOW sets the duration. After a restart the state is restored from recent task records. No extension upgrade is needed."
   ]
 }
